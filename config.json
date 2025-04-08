@@ -1,9 +1,10 @@
 {
-    "gemini_programmer_api_key": "API_KEY_TO_PROGRAMMER",
-    "gemini_context_api_key": "API_KEY_TO_CONTEXT",
-    "programmer_model_name": "gemini-2.5-pro-exp-03-25", 
+    "gemini_programmer_api_key": "PROGRAMER_KEY",
+    "gemini_context_api_key": "CONTEXT_KEY",
+    "programmer_model_name": "gemini-2.0-flash", 
     "context_model_name": "gemini-2.0-flash",
     "gemini_files_directory": "./gemini_files",
-    "max_output_tokens": 8192
+    "max_output_tokens": 8192,
+    "server_port": 3000
 }
   
