@@ -1,366 +1,166 @@
-// index.js (Versão: Sem loop de resposta para Programador)
-// Importa as bibliotecas necessárias
-const { GoogleGenerativeAI, HarmCategory, HarmBlockThreshold } = require("@google/generative-ai");
-const fs = require('fs');
-const path = require('path');
-const readline = require('readline').createInterface({
-  input: process.stdin,
-  output: process.stdout,
-});
+const { loadBehavior } = require('./behaviorLoader');
+const { GoogleGenerativeAI, HarmCategory, HarmBlockThreshold } = require("@google/generative-ai"); // Importa do SDK
 
-// --- Carregamento da Configuração ---
-let config;
-try {
-  config = require('./config.json');
-} catch (error) {
-  console.error("Erro: Falha ao carregar o arquivo config.json.", error);
-  console.log("Certifique-se de que o arquivo config.json existe no mesmo diretório e tem o formato correto.");
-  process.exit(1);
-}
+/**
+ * Gera uma resposta usando o modelo Gemini, suportando comportamento e ferramentas personalizadas.
+ * @param {string} prompt Prompt do usuário.
+ * @param {object|null} behavior Objeto de comportamento do assistente.
+ * @param {string} apiKey Chave de API do Google AI Studio.
+ * @param {string} [toolsFilePath] Caminho opcional para o arquivo .js contendo as implementações das ferramentas.
+ * @param {string} [configFilePath] Caminho opcional para o arquivo de configuração agents.config.json.
+ * @returns {Promise<string>} A resposta final em texto do modelo.
+ */
+async function generateResponse(prompt, behavior, apiKey, toolsFilePath, configFilePath) {
+  if (!apiKey) throw new Error("API Key é obrigatória.");
+  if (!prompt) throw new Error("Prompt é obrigatório.");
 
-// Validação das configurações (simplificada)
-if (!config.gemini_programmer_api_key || !config.gemini_context_api_key ||
-    config.gemini_programmer_api_key.startsWith("SUA_API_KEY") ||
-    config.gemini_context_api_key.startsWith("SUA_API_KEY")) {
-    console.error("Erro: API Keys não configuradas corretamente em config.json.");
-    process.exit(1);
-}
+  let behaviorData = null;
+  let loadedTools = null;
+  let functionDeclarations = null;
+  let agentConfig = { // Define um objeto padrão
+      defaultModel: "gemini-pro",
+      maxOutputTokens: 2048,
+      safetySettings: [
+          { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_MEDIUM_AND_ABOVE" },
+          { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "BLOCK_MEDIUM_AND_ABOVE" },
+          { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "BLOCK_MEDIUM_AND_ABOVE" },
+          { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_MEDIUM_AND_ABOVE" }
+      ]
+  };
 
-const GEMINI_FILES_DIR = path.resolve(config.gemini_files_directory || './gemini_files');
-
-// Cria o diretório se não existir
-if (!fs.existsSync(GEMINI_FILES_DIR)) {
   try {
-    fs.mkdirSync(GEMINI_FILES_DIR, { recursive: true });
-    console.log(`Diretório criado: ${GEMINI_FILES_DIR}`);
-  } catch (error) {
-    console.error(`Erro ao criar o diretório ${GEMINI_FILES_DIR}:`, error);
-    process.exit(1);
-  }
-} else {
-    console.log(`Usando diretório existente: ${GEMINI_FILES_DIR}`);
-}
-
-// --- Implementação das Funções de Apoio e Ferramentas ---
-
-// Função JS para listar arquivos (usada pelo Orquestrador)
-async function listFilesInternal() {
-    console.log(`[Orchestrator] Listando arquivos em: ${GEMINI_FILES_DIR}`);
-    try {
-        const files = await fs.promises.readdir(GEMINI_FILES_DIR);
-        console.log(`[Orchestrator] Arquivos encontrados: ${files.length}`);
-        return files; // Retorna array de nomes
-    } catch (error) {
-        console.error(`[Orchestrator] Erro ao listar arquivos:`, error);
-        return []; // Retorna array vazio em caso de erro
-    }
-}
-
-// Função para obter conteúdo (usada pelo Orquestrador ao responder à ferramenta do Contexto)
-// Retorna um objeto estruturado { filename: content/error, ... }
-async function getContextFromFile(fileNames) {
-  if (!Array.isArray(fileNames)) {
-      console.error("[Tool Error - Contexto] getContextFromFile chamado sem um array de nomes.");
-      return { error: "Input inválido: file_name deve ser um array." };
-  }
-  console.log(`[Tool Call - Contexto] getContextFromFile chamado para: ${fileNames.join(', ')}`);
-  const results = {};
-  for (const fileName of fileNames) {
-    const filePath = path.join(GEMINI_FILES_DIR, fileName);
-    try {
-      if (fileName.includes('..') || fileName.includes('/')) throw new Error("Nome de arquivo inválido.");
-      if (!fs.existsSync(filePath)) throw new Error(`Arquivo "${fileName}" não encontrado.`);
-      const content = await fs.promises.readFile(filePath, 'utf8');
-      results[fileName] = content;
-      console.log(`[Tool Success - Contexto] Contexto lido de: ${filePath}`);
-    } catch (error) {
-      console.error(`[Tool Error - Contexto] Erro ao ler ${filePath}:`, error);
-      results[fileName] = `Erro ao ler o arquivo "${fileName}": ${error.message}`;
-    }
-  }
-  return results;
-}
-
-// Função para formatar o contexto para o Programador
-function formatContextForProgrammer(structuredContext) {
-    if (!structuredContext || Object.keys(structuredContext).length === 0 || structuredContext.error) {
-        return "";
-    }
-    let contextString = "";
-    for (const [name, content] of Object.entries(structuredContext)) {
-        if (!content.startsWith('Erro ao ler o arquivo')) {
-             contextString += `\n--- Conteúdo de ${name} ---\n${content}\n--- Fim de ${name} ---\n`;
-        } else {
-             contextString += `\n--- Erro ao ler ${name}: ${content} ---\n`;
+    // 0. Carrega as configurações do arquivo agents.config.json (se fornecido)
+    if (configFilePath) {
+        try {
+            agentConfig = require(configFilePath);
+            console.log(`[AgentConfig] Configurações carregadas de: ${configFilePath}`);
+        } catch (configError) {
+            console.warn(`[AgentConfig] Falha ao carregar arquivo de configuração: ${configError.message}. Usando configurações padrão.`);
+            // Mantém as configurações padrão já definidas
         }
+    } else {
+        console.log("[AgentConfig] Nenhum arquivo de configuração fornecido. Usando configurações padrão.");
     }
-    return contextString.trim();
-}
 
-
-// Função para criar arquivo (usada pelo Programador)
-async function createFile(fileName, fileContent) {
-  const filePath = path.join(GEMINI_FILES_DIR, fileName);
-  console.log(`[Tool Call - Programador] Tentando criar arquivo: ${filePath}`);
-  try {
-    if (fileName.includes('..') || fileName.includes('/')) throw new Error("Nome de arquivo inválido.");
-    await fs.promises.writeFile(filePath, fileContent, 'utf8');
-    const successMsg = `Arquivo "${fileName}" criado com sucesso.`;
-    console.log(`[Tool Success - Programador] ${successMsg}`);
-    return successMsg; // Retorna mensagem de sucesso
-  } catch (error) {
-    const errorMsg = `Erro ao criar o arquivo "${fileName}": ${error.message}`;
-    console.error(`[Tool Error - Programador] ${errorMsg}`);
-    return errorMsg; // Retorna mensagem de erro
-  }
-}
-
-// Função para modificar arquivo (usada pelo Programador)
-async function modifyFile(fileName, pieceToReplace, replaceWith) {
-  const filePath = path.join(GEMINI_FILES_DIR, fileName);
-  console.log(`[Tool Call - Programador] Tentando modificar arquivo: ${filePath}`);
-  try {
-    if (fileName.includes('..') || fileName.includes('/')) throw new Error("Nome de arquivo inválido.");
-    if (!fs.existsSync(filePath)) throw new Error(`Arquivo "${fileName}" não encontrado.`);
-    const currentContent = await fs.promises.readFile(filePath, 'utf8');
-    if (!currentContent.includes(pieceToReplace)) {
-      const warnMsg = `Atenção: O trecho "${pieceToReplace}" não foi encontrado em "${fileName}". Nenhuma modificação feita.`;
-      console.warn(`[Tool Warning - Programador] ${warnMsg}`);
-      return warnMsg;
+    // 1. Carrega comportamento e ferramentas (se aplicável)
+    if (behavior) {
+      behaviorData = await loadBehavior(behavior, toolsFilePath);
+      loadedTools = behaviorData?.loadedTools;
+      // Usa as declarações do JSON de comportamento
+      functionDeclarations = behaviorData?.tools?.length > 0 ? behaviorData.tools : null;
     }
-    const newContent = currentContent.replace(pieceToReplace, replaceWith);
-    await fs.promises.writeFile(filePath, newContent, 'utf8');
-    const successMsg = `Arquivo "${fileName}" modificado com sucesso.`;
-    console.log(`[Tool Success - Programador] ${successMsg}`);
-    return successMsg;
-  } catch (error) {
-    const errorMsg = `Erro ao modificar o arquivo "${fileName}": ${error.message}`;
-    console.error(`[Tool Error - Programador] ${errorMsg}`);
-    return errorMsg;
-  }
-}
 
+    // 2. Constrói o prompt inicial com instruções de comportamento
+    let systemInstructions = [];
+    if (behaviorData?.nome) systemInstructions.push(`Você é ${behaviorData.nome}.`);
+    if (behaviorData?.instrucoes) systemInstructions.push(`Siga estas instruções: ${behaviorData.instrucoes}`);
+    if (behaviorData?.['tom de resposta']) systemInstructions.push(`Responda em um tom ${behaviorData['tom de resposta']}.`);
+    if (behaviorData?.memorias) systemInstructions.push(`Lembre-se disso: ${behaviorData.memorias}`);
 
-// --- Definição das Ferramentas para cada Modelo ---
-
-// Ferramentas para o Contexto (apenas get_context_from_file)
-const tools_contexto = [{
-  functionDeclarations: [{
-    name: "get_context_from_file",
-    description: "Obtém o conteúdo completo de um ou mais arquivos especificados pelo nome para análise ou contexto.",
-    parameters: {
-      type: "object",
-      properties: {
-        file_name: {
-          type: "array",
-          description: "Uma lista (array) de nomes de arquivos dos quais obter o conteúdo.",
-          items: {
-            type: "string"
-          }
-        }
-      },
-      required: ["file_name"]
+    const initialPromptParts = [];
+    if (systemInstructions.length > 0) {
+        // Adiciona instruções como uma mensagem separada ou prefixo
+         initialPromptParts.push({ text: systemInstructions.join('\n') + "\n---" });
     }
-  }]
-}];
+     initialPromptParts.push({ text: prompt }); // Adiciona o prompt do usuário
 
-// Ferramentas para o Programador (criar/modificar)
-const tools_programador = [{
-  functionDeclarations: [
-    {
-      name: "create_file",
-      description: "Cria um novo arquivo com nome e conteúdo especificados.",
-      parameters: { /* ... (igual antes) ... */
-          type: "object",
-          properties: {
-            file_name: { type: "string", description: "O nome do arquivo a ser criado (ex: 'meuScript.js')." },
-            file_content: { type: "string", description: "O conteúdo completo do novo arquivo." }
-          },
-          required: ["file_name", "file_content"]
+
+    // 3. Inicializa o cliente e o modelo Gemini
+    const genAI = new GoogleGenerativeAI(apiKey);
+    const model = genAI.getGenerativeModel({
+      model: agentConfig.defaultModel, // Usa o modelo padrão do arquivo de configuração
+      // Passa as declarações de ferramentas se existirem
+      tools: functionDeclarations ? [{ functionDeclarations }] : undefined,
+      safetySettings: agentConfig.safetySettings.map(s => ({ // Usa safety settings do config
+          category: HarmCategory[s.category], // Converte string para enum
+          threshold: HarmBlockThreshold[s.threshold] // Converte string para enum
+      })),
+      generationConfig: {
+          maxOutputTokens: agentConfig.maxOutputTokens, // Usa maxOutputTokens do config
       }
-    },
-    {
-      name: "modify_file",
-      description: "Modifica um arquivo existente substituindo um trecho específico por outro.",
-      parameters: { /* ... (igual antes) ... */
-          type: "object",
-          properties: {
-            file_name: { type: "string", description: "O nome do arquivo a ser modificado." },
-            piece_to_replace: { type: "string", description: "O trecho exato a ser substituído." },
-            replace_with: { type: "string", description: "O novo texto que substituirá o trecho." }
-          },
-          required: ["file_name", "piece_to_replace", "replace_with"]
-      }
-    }
-  ]
-}];
-
-// --- Inicialização dos Clientes Gemini ---
-
-const genAIProgrammer = new GoogleGenerativeAI(config.gemini_programmer_api_key);
-const genAIContext = new GoogleGenerativeAI(config.gemini_context_api_key);
-
-const safetySettings = [
-    { category: HarmCategory.HARM_CATEGORY_HARASSMENT, threshold: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE },
-    { category: HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE },
-    { category: HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE },
-    { category: HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE },
-];
-
-const generationConfig = {
-    maxOutputTokens: config.max_output_tokens || 2048,
-};
-
-// Modelo de Contexto (com get_context_from_file)
-const modelContexto = genAIContext.getGenerativeModel({
-  model: config.context_model_name,
-  tools: tools_contexto,
-  safetySettings: safetySettings,
-  generationConfig: generationConfig
-});
-
-// Modelo Programador (com criar/modificar)
-const modelProgramador = genAIProgrammer.getGenerativeModel({
-  model: config.programmer_model_name,
-  tools: tools_programador,
-  safetySettings: safetySettings,
-  generationConfig: generationConfig
-});
-
-
-// --- Função Principal de Chat (Orquestração) ---
-async function runChat() {
-  // Chat principal com o Programador
-  const chatProgramador = modelProgramador.startChat({
-    history: [
-         { role: "user", parts: [{ text: `Você é um assistente de programação AI. Você pode criar e modificar arquivos no diretório '${GEMINI_FILES_DIR}'. O contexto relevante dos arquivos existentes será fornecido quando necessário. Use as ferramentas 'create_file' e 'modify_file' para completar as tarefas.` }] },
-         { role: "model", parts: [{ text: "Entendido. Estou pronto para programar. Receberei o contexto necessário e usarei as ferramentas para criar ou modificar arquivos conforme solicitado. Como posso ajudar?" }] },
-    ],
-  });
-
-  console.log("Chat iniciado (Sem loop de resposta para Programador). Digite 'sair' para terminar.");
-
-  askQuestion();
-
-  async function askQuestion() {
-    readline.question('Você: ', async (msg) => {
-      if (msg.toLowerCase() === 'sair') {
-        readline.close();
-        console.log("Chat encerrado.");
-        return;
-      }
-
-      try {
-        console.log("\n--- Etapa 1: Consultando Modelo de Contexto ---");
-
-        // 1a: Listar arquivos internamente
-        const currentFiles = await listFilesInternal();
-        const fileListString = currentFiles.length > 0 ? currentFiles.join(', ') : 'Nenhum arquivo encontrado.';
-        console.log(`[Orchestrator] Arquivos atuais: ${fileListString}`);
-
-        // 1b: Chamar Modelo de Contexto
-        const promptContexto = `Analisando a solicitação do usuário: "${msg}".\nOs arquivos existentes no diretório são: [${fileListString}].\nQuais desses arquivos são relevantes para fornecer contexto? Se algum for relevante, use a ferramenta 'get_context_from_file' para obter o conteúdo APENAS dos arquivos relevantes. Se nenhum for relevante ou nenhum existir, responda apenas com "Nenhum contexto necessário."`;
-
-        let structuredContextResult = null;
-
-        const resultContexto = await modelContexto.generateContent([promptContexto]);
-
-        const functionCallsContexto = resultContexto.response.functionCalls();
-
-        if (functionCallsContexto && functionCallsContexto.length > 0) {
-            const call = functionCallsContexto[0];
-            if (call.name === 'get_context_from_file') {
-                console.log(`[Contexto] Solicitou contexto para: ${call.args.file_name.join(', ')}`);
-                // 1c: Executar a função e ARMAZENAR o resultado
-                structuredContextResult = await getContextFromFile(call.args.file_name);
-                console.log("[Orchestrator] Contexto obtido.");
-                // 1d: Não fazer mais nada com o modelContexto
-            } else {
-                 console.warn(`[Contexto] Chamou função inesperada: ${call.name}`);
-            }
-        } else {
-             console.log("[Contexto] Decidiu não chamar get_context_from_file:", resultContexto.response.text());
-        }
-
-
-        // --- Etapa 2: Formatar Conteúdo (se obtido) ---
-        let formattedContext = "";
-        if (structuredContextResult) {
-            console.log("\n--- Etapa 2: Formatando Conteúdo Obtido ---");
-            formattedContext = formatContextForProgrammer(structuredContextResult);
-            console.log("[Orchestrator] Contexto formatado para o Programador.");
-        } else {
-            console.log("\n--- Etapa 2: Nenhum contexto foi solicitado ou obtido ---");
-        }
-
-        // --- Etapa 3: Chamada ao Modelo Programador ---
-        console.log("\n--- Etapa 3: Consultando Modelo Programador ---");
-
-        const promptProgramador = `${msg}${formattedContext ? `\n\n### Contexto dos Arquivos Relevantes ###\n${formattedContext}\n### Fim do Contexto ###` : ''}`;
-        console.log("Enviando para o Programador...");
-
-
-        const resultProgramador = await chatProgramador.sendMessage(promptProgramador);
-        const responseProgramador = resultProgramador.response; // Acessa a resposta
-
-        const functionCallsProgramador = responseProgramador.functionCalls();
-        const textResponseProgramador = responseProgramador.text();
-
-        // --- Etapa 4: Executar Ação do Programador (se houver) ou Mostrar Texto ---
-
-        if (functionCallsProgramador && functionCallsProgramador.length > 0) {
-            console.log(`[Programador] Solicitou chamada de função: ${functionCallsProgramador.map(fc => fc.name).join(', ')}`);
-
-            // Executa a(s) função(ões) solicitada(s) - geralmente apenas uma
-            for (const call of functionCallsProgramador) {
-                const { name, args } = call;
-                let functionResult = "Erro: Função não reconhecida."; // Mensagem padrão
-                console.log(`  -> Executando ${name} com args:`, args);
-
-                try {
-                    if (name === 'create_file') {
-                        functionResult = await createFile(args.file_name, args.file_content);
-                    } else if (name === 'modify_file') {
-                        functionResult = await modifyFile(args.file_name, args.piece_to_replace, args.replace_with);
-                    } else {
-                        console.warn(`[Programador] Função desconhecida chamada: ${name}`);
-                        functionResult = `Erro: Função ${name} não implementada.`;
-                    }
-                } catch (error) {
-                     console.error(`[Programador] Erro ao executar a função ${name}:`, error);
-                     functionResult = `Erro interno ao executar ${name}: ${error.message}`;
-                }
-
-                // Informa diretamente ao usuário o resultado da execução da ferramenta
-                console.log(`\n[Orquestrador] Resultado da ação solicitada pela IA: ${functionResult}`);
-            }
-            // Não envia nada de volta para a API nem espera outra resposta dela nesta rodada.
-
-        } else if (textResponseProgramador) {
-            // Se não houve chamada de função, apenas mostra a resposta de texto do Programador
-            console.log('\nGemini (Programador):', textResponseProgramador);
-        } else {
-            // Caso raro: sem texto e sem função
-             console.log('\n[Orquestrador] O Programador não forneceu texto nem solicitou ação.');
-        }
-
-      } catch (error) {
-        console.error("\nErro no fluxo principal do chat:", error);
-        if (error instanceof Error && error.message.includes('GoogleGenerativeAIError')) {
-             console.error("Detalhes do Erro da API:", error);
-         } else if (error.response && error.response.promptFeedback) {
-            console.error("Feedback do Prompt:", error.response.promptFeedback);
-        } else if (error.message && error.message.includes("429")) {
-            console.error("Erro: Limite de taxa da API atingido. Espere um pouco antes de tentar novamente.");
-         } else if (error.message && error.message.includes("JSON")) {
-             console.error("Erro: Problema ao processar JSON. Verifique a resposta do modelo ou da ferramenta.");
-         }
-      }
-
-      askQuestion(); // Pergunta novamente
     });
+
+    // 4. Inicia o chat (sem histórico prévio neste exemplo simples)
+    const chat = model.startChat(); // Começa um novo chat para cada chamada
+
+    // 5. Envia a mensagem inicial (prompt + instruções)
+    console.log("[Request AI] Enviando prompt inicial...");
+    let result = await chat.sendMessage(initialPromptParts);
+    let response = result.response;
+    let functionCall = response.functionCalls()?.[0];
+
+    // 6. Loop de chamada de função
+    while (functionCall) {
+      const { name, args } = functionCall;
+      console.log(`[Response AI] Solicitou chamada de função: ${name}`);
+
+      // Verifica se a ferramenta está carregada
+      const toolFunction = loadedTools?.[name];
+      if (!toolFunction) {
+        console.error(`[Tool Error] Função "${name}" solicitada pela IA, mas não encontrada em ${toolsFilePath || 'nenhum arquivo de ferramentas fornecido'}.`);
+        // Decide como lidar: retornar erro ou tentar responder sem a ferramenta?
+        // Retornar erro é mais seguro.
+        throw new Error(`Ferramenta "${name}" não encontrada ou não carregada.`);
+      }
+
+      // Executa a função da ferramenta
+      let toolResultContent;
+      try {
+        console.log(`[Tool Execution] Executando: ${name} com args:`, args);
+        // Chama a função do usuário (pode ser async)
+        const rawToolResult = await toolFunction(args);
+        console.log(`[Tool Execution] Resultado bruto:`, rawToolResult);
+        // O conteúdo a ser enviado de volta é o resultado bruto da função
+        toolResultContent = rawToolResult;
+      } catch (toolError) {
+        console.error(`[Tool Execution Error] Erro na ferramenta ${name}:`, toolError);
+        // Informa a IA sobre o erro
+        toolResultContent = { error: `Erro ao executar a ferramenta ${name}: ${toolError.message}` };
+      }
+
+      // Envia o resultado da função de volta para a IA
+      console.log(`[Request AI] Enviando resultado da ferramenta ${name} de volta...`);
+      result = await chat.sendMessage([
+        { // Envia a resposta da função como uma FunctionResponsePart
+          functionResponse: {
+            name: name,
+            response: {
+              // A API espera o 'name' aqui também, e 'content' com o resultado
+              name: name,
+              content: toolResultContent,
+            },
+          },
+        },
+      ]);
+      response = result.response;
+
+      // Verifica se a nova resposta contém outra chamada de função
+      functionCall = response.functionCalls()?.[0];
+    }
+
+    // 7. Retorna a resposta final em texto
+    const finalText = response.text();
+    console.log("[Response AI] Resposta final em texto:", finalText);
+    return finalText;
+
+  } catch (error) {
+    console.error("Erro detalhado em generateResponse:", error);
+    // Melhora o tratamento de erro para incluir mais contexto
+    let errorMessage = `Falha ao gerar resposta: ${error.message || 'Erro desconhecido'}`;
+    if (error instanceof Error && error.message.startsWith('HTTP error!')) {
+        errorMessage = `Falha ao se comunicar com a API do Gemini. ${error.message}`;
+    } else if (error instanceof Error && error.message.includes('Não foi possível carregar')) {
+         errorMessage = error.message; // Erro do behaviorLoader
+    } else if (error instanceof Error && error.message.includes('Resposta da API inesperada ou bloqueada')) {
+         errorMessage = `Falha ao processar resposta da API. ${error.message}`;
+    } else if (error.response?.promptFeedback) {
+         errorMessage = `Requisição bloqueada pela API Gemini. Razão: ${error.response.promptFeedback.blockReason || 'Desconhecida'}. Detalhes: ${JSON.stringify(error.response.promptFeedback)}`;
+    } else if (error.message?.includes('429')) {
+         errorMessage = `Limite de taxa da API Gemini atingido. Tente novamente mais tarde.`;
+    }
+    // Lança um novo erro com a mensagem formatada
+    throw new Error(errorMessage);
   }
 }
 
-// Inicia o chat
-runChat();
+module.exports = { generateResponse };

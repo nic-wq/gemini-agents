@@ -1,5 +1,19 @@
 {
   "dependencies": {
-    "@google/generative-ai": "^0.24.0"
-  }
+    "@nic-wq/gemini-agents": "^1.0.2",
+    "node-fetch": "^3.0.0"
+  },
+  "name": "@nic-wq/gemini-agents",
+  "version": "1.0.2",
+  "description": "A npm package to build agents using the gemini API (in progress)",
+  "main": "index.js",
+  "scripts": {
+    "test": "npm link"
+  },
+  "keywords": [
+    "agents",
+    "gemini"
+  ],
+  "author": "nic-wq",
+  "license": "ISC"
 }
